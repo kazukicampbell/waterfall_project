@@ -81,6 +81,16 @@ customer AS (
     --AND cus.livemode = TRUE
 ),
 
+-- Create mapping of sfdc_account_id to concatenated stripe_customer_ids
+account_customer_mapping AS (
+  SELECT 
+    sfdc_account_id,
+    STRING_AGG(DISTINCT stripe_customer_id, ', ' ORDER BY stripe_customer_id) AS concat_stripe_customer_ids
+  FROM customer
+  WHERE sfdc_account_id IS NOT NULL
+  GROUP BY sfdc_account_id
+),
+
 -- Only need the most recent version of a subscription record for this analysis
 -- doesn't exist in analytics project
 subscription AS (
@@ -160,10 +170,11 @@ invoice_discounts AS (
 -- Join all base tables together
 base_joined_data AS (
   SELECT 
+    COALESCE(cus.sfdc_account_id, cus.stripe_customer_id) AS grouping_key,
+    acm.concat_stripe_customer_ids,
     cus.sfdc_account_id,
     cus.stripe_customer_id,
     cus.contracted_customer,
-    cus.stripe_customer_name,
     sub.id AS subscription_id,
     sub.created AS sub_created,
     sub.status AS sub_status,
@@ -211,6 +222,9 @@ base_joined_data AS (
 
   LEFT JOIN invoice_discounts aid 
     ON inv.stripe_invoice_id = aid.invoice_id
+  
+  LEFT JOIN account_customer_mapping acm
+    ON cus.sfdc_account_id = acm.sfdc_account_id
 ),
 
 -- Apply discount logic and calculate final MRR/ARR
@@ -278,21 +292,20 @@ base_data_with_discounts AS (
 -- Get customer first subscription info across all products
 customer_first_subscription AS (
   SELECT 
-    MAX(sfdc_account_id) AS sfdc_account_id,
-    MAX(CASE WHEN sfdc_account_id IS NULL THEN stripe_customer_id END) AS stripe_customer_id,
+    grouping_key,
+    concat_stripe_customer_ids,
     MIN(sub_created) AS customer_first_sub_date,
     MIN(DATE(DATE_TRUNC(line_item_period_start, MONTH))) AS customer_first_period
   FROM base_data_with_discounts
   WHERE line_item_amount > 0
-  GROUP BY COALESCE(sfdc_account_id, stripe_customer_id)
+  GROUP BY ALL
 ),
 
 -- Aggregate at customer-product_type-period level (removed line_item_product_name)
 customer_product_periods AS (
   SELECT 
-    sfdc_account_id,
-    stripe_customer_id,
-    stripe_customer_name,
+    grouping_key,
+    concat_stripe_customer_ids,
     contracted_customer,
     product_type,
     DATE(DATE_TRUNC(line_item_period_start, MONTH)) AS period_month,
@@ -302,7 +315,7 @@ customer_product_periods AS (
     
   FROM base_data_with_discounts
   WHERE line_item_amount > 0
-  GROUP BY sfdc_account_id, stripe_customer_id, stripe_customer_name, contracted_customer, product_type, period_month
+  GROUP BY ALL
 ),
 
 -- Add previous period data - tracking by product_type
@@ -311,47 +324,33 @@ customer_product_with_previous AS (
     cpp.*,
     cfs.customer_first_sub_date,
     cfs.customer_first_period,
-    CASE 
-      WHEN cpp.sfdc_account_id IS NOT NULL THEN LAG(cpp.period_net_arr, 1) OVER (PARTITION BY cpp.sfdc_account_id, cpp.product_type ORDER BY cpp.period_month) 
-      ELSE LAG(cpp.period_net_arr, 1) OVER (PARTITION BY cpp.stripe_customer_id, cpp.product_type ORDER BY cpp.period_month)  
-    END AS previous_period_arr,
-
-    CASE 
-      WHEN cpp.sfdc_account_id IS NOT NULL THEN LAG(cpp.period_net_mrr, 1) OVER (PARTITION BY cpp.sfdc_account_id, cpp.product_type ORDER BY cpp.period_month) 
-      ELSE LAG(cpp.period_net_mrr, 1) OVER (PARTITION BY cpp.stripe_customer_id, cpp.product_type ORDER BY cpp.period_month)  
-    END AS previous_period_mrr,
-
-    CASE
-      WHEN cpp.sfdc_account_id IS NOT NULL THEN LAG(cpp.period_month, 1) OVER (PARTITION BY cpp.sfdc_account_id, cpp.product_type ORDER BY cpp.period_month)
-      ELSE LAG(cpp.period_month, 1) OVER (PARTITION BY cpp.stripe_customer_id, cpp.product_type ORDER BY cpp.period_month) 
-    END AS previous_period_month,
+    
+    LAG(cpp.period_net_arr, 1) OVER (PARTITION BY cpp.grouping_key, cpp.product_type ORDER BY cpp.period_month) AS previous_period_arr,
+    LAG(cpp.period_net_mrr, 1) OVER (PARTITION BY cpp.grouping_key, cpp.product_type ORDER BY cpp.period_month) previous_period_mrr,
+    LAG(cpp.period_month, 1) OVER (PARTITION BY cpp.grouping_key, cpp.product_type ORDER BY cpp.period_month) AS previous_period_month,
     
     -- Check if customer had this product_type before (for reactivation detection)
     CASE 
-      WHEN cpp.sfdc_account_id IS NOT NULL AND LAG(cpp.period_net_arr, 1) OVER (PARTITION BY cpp.sfdc_account_id, cpp.product_type ORDER BY cpp.period_month) > 0 THEN 1
-      WHEN cpp.sfdc_account_id IS NOT NULL AND COUNT(cpp.period_month) OVER (PARTITION BY cpp.sfdc_account_id, cpp.product_type ORDER BY cpp.period_month ROWS UNBOUNDED PRECEDING) > 1 THEN 1
-      WHEN LAG(cpp.period_net_arr, 1) OVER (PARTITION BY cpp.sfdc_account_id, cpp.product_type ORDER BY cpp.period_month) > 0 THEN 1
-      WHEN COUNT(cpp.period_month) OVER (PARTITION BY cpp.sfdc_account_id, cpp.product_type ORDER BY cpp.period_month ROWS UNBOUNDED PRECEDING) > 1 THEN 1
+      WHEN LAG(cpp.period_net_arr, 1) OVER (PARTITION BY cpp.grouping_key, cpp.product_type ORDER BY cpp.period_month) > 0 THEN 1
+      WHEN COUNT(cpp.period_month) OVER (PARTITION BY cpp.grouping_key, cpp.product_type ORDER BY cpp.period_month ROWS UNBOUNDED PRECEDING) > 1 THEN 1
       ELSE 0 
     END AS had_revenue_before,
     
     -- Check if customer had ANY product in this product_type before (for cross-sell vs expansion)
     CASE 
-      WHEN cpp.sfdc_account_ID IS NOT NULL AND COUNT(cpp.period_month) OVER (PARTITION BY cpp.sfdc_account_id, cpp.product_type ORDER BY cpp.period_month ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) > 0 THEN 1
-      WHEN COUNT(cpp.period_month) OVER (PARTITION BY cpp.stripe_customer_id, cpp.product_type ORDER BY cpp.period_month ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) > 0 THEN 1  
+      WHEN COUNT(cpp.period_month) OVER (PARTITION BY cpp.grouping_key, cpp.product_type ORDER BY cpp.period_month ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) > 0 THEN 1
     ELSE 0 END AS had_product_type_before
     
   FROM customer_product_periods cpp
   LEFT JOIN customer_first_subscription cfs 
-    ON COALESCE(cpp.sfdc_account_id, cpp.stripe_customer_id) = COALESCE(cfs.sfdc_account_id, cfs.stripe_customer_id)
+    ON cpp.grouping_key = cfs.grouping_key
 ),
 
 -- Generate churn events at product_type level
 churn_events AS (
   SELECT 
-    sfdc_account_id,
-    stripe_customer_id,
-    stripe_customer_name,
+    grouping_key,
+    concat_stripe_customer_ids,
     contracted_customer,
     product_type,
     CAST(DATE_TRUNC(sub_ended_at, MONTH) AS DATETIME) period_month,
@@ -359,8 +358,8 @@ churn_events AS (
     0.00 AS period_net_mrr,
     net_arr AS previous_period_arr,
     net_mrr AS previous_period_mrr,
-    MIN(sub_created) OVER(PARTITION BY stripe_customer_id) AS customer_first_sub_date,
-    MIN(DATE(DATE_TRUNC(line_item_period_start, MONTH))) OVER(PARTITION BY stripe_customer_id) AS customer_first_period,
+    MIN(sub_created) OVER(PARTITION BY grouping_key) AS customer_first_sub_date,
+    MIN(DATE(DATE_TRUNC(line_item_period_start, MONTH))) OVER(PARTITION BY grouping_key) AS customer_first_period,
     'Churn' AS event_type,
     ROUND(-1 * net_arr, 2) AS arr_change_amount,
     ROUND(-1 * net_mrr, 2) AS mrr_change_amount,
@@ -377,10 +376,9 @@ churn_events AS (
 -- Generate all subscription events at product_type level
 active_subscription_events AS (
   SELECT 
-    stripe_customer_id,
-    stripe_customer_name,
+    grouping_key,
+    concat_stripe_customer_ids,
     contracted_customer,
-    sfdc_account_id,
     product_type,
     period_month,
     period_net_arr,
@@ -450,9 +448,8 @@ active_subscription_events AS (
 -- Combine active events and churn events
 all_subscription_events AS (
   SELECT 
-    stripe_customer_id,
-    stripe_customer_name,
-    sfdc_account_id,
+    grouping_key,
+    concat_stripe_customer_ids,
     contracted_customer,
     product_type,
     period_month,
@@ -472,9 +469,8 @@ all_subscription_events AS (
   UNION ALL
   
   SELECT 
-    stripe_customer_id,
-    stripe_customer_name,
-    sfdc_account_id,
+    grouping_key,
+    concat_stripe_customer_ids,
     contracted_customer,
     product_type,
     period_month,
@@ -494,9 +490,8 @@ all_subscription_events AS (
 -- Final waterfall reporting at product_type level
 final_waterfall AS (
   SELECT 
-    stripe_customer_id,
-    stripe_customer_name,
-    sfdc_account_id,
+    grouping_key,
+    concat_stripe_customer_ids,
     contracted_customer,
     product_type,
     period_month,
@@ -515,35 +510,35 @@ final_waterfall AS (
     previous_period_mrr,
     arr_change_amount,
     mrr_change_amount,
-    arr_change_percent,
-    mrr_change_percent,
+    --arr_change_percent,
+    --mrr_change_percent,
     
     -- Customer-level opening/closing aggregations (across all products)
-    SUM(COALESCE(previous_period_mrr, 0)) OVER (PARTITION BY stripe_customer_id, period_month) AS opening_customer_mrr,
-    SUM(COALESCE(period_net_mrr, 0)) OVER (PARTITION BY stripe_customer_id, period_month) AS closing_customer_mrr,
-    SUM(COALESCE(previous_period_arr, 0)) OVER (PARTITION BY stripe_customer_id, period_month) AS opening_customer_arr,
-    SUM(COALESCE(period_net_arr, 0)) OVER (PARTITION BY stripe_customer_id, period_month) AS closing_customer_arr,
+    SUM(COALESCE(previous_period_mrr, 0)) OVER (PARTITION BY grouping_key, period_month) AS opening_customer_mrr,
+    SUM(COALESCE(period_net_mrr, 0)) OVER (PARTITION BY grouping_key, period_month) AS closing_customer_mrr,
+    SUM(COALESCE(previous_period_arr, 0)) OVER (PARTITION BY grouping_key, period_month) AS opening_customer_arr,
+    SUM(COALESCE(period_net_arr, 0)) OVER (PARTITION BY grouping_key, period_month) AS closing_customer_arr,
     
     -- Customer-level totals
-    SUM(period_net_arr) OVER (PARTITION BY stripe_customer_id, period_month) AS customer_total_arr,
-    SUM(period_net_mrr) OVER (PARTITION BY stripe_customer_id, period_month) AS customer_total_mrr,
-    SUM(arr_change_amount) OVER (PARTITION BY stripe_customer_id, period_month) AS customer_total_arr_change,
-    SUM(mrr_change_amount) OVER (PARTITION BY stripe_customer_id, period_month) AS customer_total_mrr_change,
+    SUM(period_net_arr) OVER (PARTITION BY grouping_key, period_month) AS customer_total_arr,
+    SUM(period_net_mrr) OVER (PARTITION BY grouping_key, period_month) AS customer_total_mrr,
+    SUM(arr_change_amount) OVER (PARTITION BY grouping_key, period_month) AS customer_total_arr_change,
+    SUM(mrr_change_amount) OVER (PARTITION BY grouping_key, period_month) AS customer_total_mrr_change,
     
     -- Period-level opening/closing aggregations (across all customers)
-    SUM(COALESCE(previous_period_mrr, 0)) OVER (PARTITION BY period_month) AS opening_period_mrr,
-    SUM(COALESCE(period_net_mrr, 0)) OVER (PARTITION BY period_month) AS closing_period_mrr,
-    SUM(COALESCE(previous_period_arr, 0)) OVER (PARTITION BY period_month) AS opening_period_arr,
-    SUM(COALESCE(period_net_arr, 0)) OVER (PARTITION BY period_month) AS closing_period_arr,
+    --SUM(COALESCE(previous_period_mrr, 0)) OVER (PARTITION BY period_month) AS opening_period_mrr,
+    --SUM(COALESCE(period_net_mrr, 0)) OVER (PARTITION BY period_month) AS closing_period_mrr,
+    --SUM(COALESCE(previous_period_arr, 0)) OVER (PARTITION BY period_month) AS opening_period_arr,
+    --SUM(COALESCE(period_net_arr, 0)) OVER (PARTITION BY period_month) AS closing_period_arr,
     
     -- Additional context
-    customer_first_sub_date,
-    COUNT(*) OVER (PARTITION BY stripe_customer_id, period_month) AS events_this_period,
+    --customer_first_sub_date,
+    --COUNT(*) OVER (PARTITION BY grouping_key, period_month) AS events_this_period,
     
     -- Waterfall period-over-period totals by event type
-    SUM(arr_change_amount) OVER (PARTITION BY period_month, event_type) AS period_event_arr_total,
-    SUM(mrr_change_amount) OVER (PARTITION BY period_month, event_type) AS period_event_mrr_total,
-    COUNT(*) OVER (PARTITION BY period_month, event_type) AS period_event_count
+    --SUM(arr_change_amount) OVER (PARTITION BY period_month, event_type) AS period_event_arr_total,
+    --SUM(mrr_change_amount) OVER (PARTITION BY period_month, event_type) AS period_event_mrr_total,
+    --COUNT(*) OVER (PARTITION BY period_month, event_type) AS period_event_count
 
   FROM all_subscription_events
 ),
@@ -553,20 +548,12 @@ missing_stripe_customers AS
 SELECT DISTINCT cus.*
 FROM base_joined_data bsj
 
-LEFT JOIN customer cus
-  ON bsj.stripe_customer_id = cus.stripe_customer_id
-
-LEFT JOIN sfdc_accounts acc
-  ON bsj.stripe_customer_id = acc.stripe_customer_id
-WHERE acc.stripe_customer_id IS NULL
+INNER JOIN customer cus
+  ON bsj.grouping_key = cus.stripe_customer_id
 )
 
 SELECT *
-FROM active_subscription_events
-WHERE 1=1
---AND contracted_customer IS FALSE
-AND sfdc_account_id = '0015a00002gYONUAA4'
-ORDER BY 1, 7
+FROM final_waterfall
 ;
 
 /*
