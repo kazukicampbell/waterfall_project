@@ -554,6 +554,8 @@ INNER JOIN customer cus
 
 SELECT *
 FROM final_waterfall
+WHERE contracted_customer IS FALSE
+ORDER BY 1, 5
 ;
 
 /*
