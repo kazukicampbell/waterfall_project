@@ -2,6 +2,9 @@
 -- stripe customer ID data hygiene not great currently so leveraging multiple SFDC objects to find it
 -- ideally SFDC contract object will be only source we need to pull stripe customer ID from
 
+/*
+Customers with contract data has been added to derived.derived_customer_contract_agg (https://github.com/GetStream/transformer/pull/485)
+*/
 WITH contracted_customers AS(
 SELECT DISTINCT
     COALESCE(con2.stripe_cust_id_c, sub.stripe_customer_id, acc.stripe_customer_id) AS stripe_customer_id,
@@ -156,6 +159,9 @@ product AS (
 ),
 
 -- Aggregate discount information per invoice
+/*
+Discount context added to sources.stripe_invoice (https://github.com/GetStream/transformer/pull/486)
+*/
 invoice_discounts AS (
   SELECT 
     invoice_id,
