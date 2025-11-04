@@ -34,6 +34,9 @@ SELECT DISTINCT
 -- If for some reason a stripe customer bleongs to multiple accounts we select the SFDC account with highest topline arr value (ideally won;t need this in future)
 
 
+/*
+derived.derived_bridge_sfdc_account_stripe_customer (https://github.com/GetStream/transformer/pull/488)
+*/
 sfdc_accounts AS(
   SELECT DISTINCT
     acc.salesforce_account_id AS sfdc_account_id,
