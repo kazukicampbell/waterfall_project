@@ -18,6 +18,7 @@ contract_clean AS(
   SELECT
     acc.salesforce_account_id,
     acc.account_name,
+    COALESCE(con.stripe_customer_id, sub.stripe_customer_id, acc.stripe_customer_id) AS stripe_customer_id,
     COALESCE(con.stripe_subscription_id, sub.stripe_subscription_id) AS stripe_subscription_id,
     COALESCE(con.contract_effective_date, con.start_date) AS contract_effective_date_clean,
     MIN(
@@ -54,6 +55,7 @@ contract_periods AS(
   SELECT DISTINCT
     con.salesforce_account_id,
     con.account_name,
+    stripe_customer_id,
     con.stripe_subscription_id,
     MIN(contract_effective_date_clean) AS first_contracted_date,
     MAX(
@@ -70,10 +72,7 @@ contract_periods AS(
   LEFT JOIN stripe_subscription sub
     ON con.stripe_subscription_id = sub.id
 
-  GROUP BY 
-    con.salesforce_account_id,
-    con.account_name,
-    con.stripe_subscription_id
+  GROUP BY ALL
 )
 
 SELECT *
