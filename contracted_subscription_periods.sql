@@ -65,7 +65,7 @@ contract_periods AS(
         ELSE
           contract_end_date_clean
       END
-    ) AS last_contract_date
+    ) AS last_contracted_date
     
   FROM contract_clean con
 
