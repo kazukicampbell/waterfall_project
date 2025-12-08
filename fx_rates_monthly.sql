@@ -232,32 +232,5 @@ CREATE OR REPLACE TABLE fx_rates AS (
   ) AS t(month_ending, type, exchange_rate)
 );
 
--- Example usage to convert MRR to USD
--- Join this table to your MRR data based on month and currency type
-WITH self_serve_with_usd AS (
-  SELECT 
-    s.*,
-    
-    -- Convert MRR to USD based on currency
-    CASE 
-      WHEN s.currency = 'eur' THEN s.mrr * fx_eur.exchange_rate
-      WHEN s.currency = 'inr' THEN s.mrr * fx_inr.exchange_rate  
-      WHEN s.currency = 'usd' THEN s.mrr
-      ELSE s.mrr  -- Keep as-is for other currencies
-    END AS mrr_usd
-    
-  FROM self_serve_monthly_product_mrr s
-  
-  -- Join EUR rates
-  LEFT JOIN fx_rates fx_eur 
-    ON DATE_TRUNC(s.month_of, MONTH) = DATE(fx_eur.month_ending)
-    AND fx_eur.type = 'EUR to USD'
-    AND s.currency = 'eur'
-    
-  -- Join INR rates  
-  LEFT JOIN fx_rates fx_inr
-    ON DATE_TRUNC(s.month_of, MONTH) = DATE(fx_inr.month_ending)
-    AND fx_inr.type = 'INR to USD'
-    AND s.currency = 'inr'
-)
+
 SELECT * FROM self_serve_with_usd;
