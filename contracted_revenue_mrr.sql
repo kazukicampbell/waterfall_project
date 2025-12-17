@@ -47,7 +47,7 @@ base_data AS (
   INNER JOIN opportunity opp
     ON acc.salesforce_account_id = opp.salesforce_account_id
   INNER JOIN contract con
-    ON opp.salesforce_opportunity_id = con.salesforce_opportunity_id
+    ON opp.salesforce_opportunity_id = con.contracted_salesforce_opportunity_id
   INNER JOIN opportunity_line_item oli
     ON opp.salesforce_opportunity_id = oli.salesforce_opportunity_id
 ),
